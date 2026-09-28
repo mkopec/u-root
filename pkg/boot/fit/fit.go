@@ -28,6 +28,10 @@ type Image struct {
 	Kernel string
 	// InitRAMFS is the name of the initramfs node.
 	InitRAMFS string
+	// DeviceTree is the name of the FDT node for an arm64 kexec_load.
+	// FITs selected for local boot must have one; older fitboot callers can
+	// continue to use the running device tree when it is empty.
+	DeviceTree string
 	// ConfigOverride is the optional FIT config to use instead of default
 	ConfigOverride string
 	// SkipInitRAMFS skips the search for an ramdisk entry in the config
@@ -149,6 +153,22 @@ func (i *Image) Load(opts ...boot.LoadOption) error {
 			}
 			image.Initrd = ir
 		}
+	}
+
+	if i.DeviceTree != "" {
+		var fdt *bytes.Reader
+		var err error
+		if i.KeyRing != nil {
+			fdt, err = i.ReadSignedImage(i.DeviceTree, i.KeyRing)
+		} else {
+			fdt, err = i.ReadImage(i.DeviceTree)
+		}
+		if err != nil {
+			return fmt.Errorf("read FIT device tree: %w", err)
+		}
+		image.DTB = fdt
+		image.LoadSyscall = true
+		// A file-load fallback would discard the FIT's chosen DTB.
 	}
 
 	return loadImage(image, opts...)

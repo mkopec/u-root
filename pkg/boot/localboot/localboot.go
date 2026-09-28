@@ -7,21 +7,26 @@ package localboot
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"sort"
+	"strings"
 
 	"github.com/u-root/u-root/pkg/boot"
 	"github.com/u-root/u-root/pkg/boot/bls"
 	"github.com/u-root/u-root/pkg/boot/esxi"
+	"github.com/u-root/u-root/pkg/boot/fit"
 	"github.com/u-root/u-root/pkg/boot/grub"
 	"github.com/u-root/u-root/pkg/boot/iso"
 	"github.com/u-root/u-root/pkg/boot/syslinux"
+	"github.com/u-root/u-root/pkg/dt"
 	"github.com/u-root/u-root/pkg/mount"
 	"github.com/u-root/u-root/pkg/mount/block"
 	"github.com/u-root/u-root/pkg/ulog"
 )
 
 // parse treats device as a block device with a file system.
-func parse(l ulog.Logger, device *block.BlockDev, devices block.BlockDevices, mountDir string, mountPool *mount.Pool) []boot.OSImage {
+func parse(l ulog.Logger, device *block.BlockDev, devices block.BlockDevices, mountDir string, mountPool *mount.Pool, compatible string) []boot.OSImage {
 	imgs, err := bls.ScanBLSEntries(l, mountDir, nil, "")
 	if err != nil {
 		l.Printf("No systemd-boot BootLoaderSpec configs found on %s, trying another format...: %v", device, err)
@@ -41,6 +46,7 @@ func parse(l ulog.Logger, device *block.BlockDev, devices block.BlockDevices, mo
 		l.Printf("No syslinux configs found on %s: %v", device, err)
 	}
 	imgs = append(imgs, syslinuxImgs...)
+	imgs = append(imgs, scanFITs(mountDir, compatible)...)
 
 	isoImgs, err := iso.ParseISOFiles(l, mountDir, device, mountPool)
 	if err == nil {
@@ -48,6 +54,35 @@ func parse(l ulog.Logger, device *block.BlockDev, devices block.BlockDevices, mo
 	}
 	imgs = append(imgs, isoImgs...)
 
+	return imgs
+}
+
+// scanFITs only looks in dedicated directories, so unrelated firmware FITs
+// and filesystems do not add surprise entries to the boot menu.
+func scanFITs(root, compatible string) []boot.OSImage {
+	if compatible == "" {
+		return nil
+	}
+	var imgs []boot.OSImage
+	for _, sub := range []string{"fit", "boot/fit"} {
+		dir := filepath.Join(root, sub)
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			continue
+		}
+		for _, e := range entries {
+			if e.IsDir() || !strings.HasSuffix(e.Name(), ".itb") {
+				continue
+			}
+			image, err := fit.New(filepath.Join(dir, e.Name()))
+			if err != nil || image.SelectForBoard(compatible) != nil {
+				continue
+			}
+			// Keep the existing GRUB entries as the default boot option.
+			image.BootRank = -1
+			imgs = append(imgs, image)
+		}
+	}
 	return imgs
 }
 
@@ -84,6 +119,12 @@ func parseUnmounted(l ulog.Logger, device *block.BlockDev, mountPool *mount.Pool
 // Localboot tries to boot from any local filesystem by parsing grub configuration
 func Localboot(l ulog.Logger, blockDevs block.BlockDevices, mp *mount.Pool) ([]boot.OSImage, error) {
 	var images []boot.OSImage
+	var compatible string
+	if fdt, err := dt.ReadFile("/sys/firmware/fdt"); err == nil {
+		if p, ok := fdt.RootNode.LookProperty("compatible"); ok {
+			compatible, _, _ = strings.Cut(string(p.Value), "\x00")
+		}
+	}
 	for _, device := range blockDevs {
 		imgs := parseUnmounted(l, device, mp)
 		if len(imgs) > 0 {
@@ -93,7 +134,7 @@ func Localboot(l ulog.Logger, blockDevs block.BlockDevices, mp *mount.Pool) ([]b
 			if err != nil {
 				continue
 			}
-			imgs = parse(l, device, blockDevs, m.Path, mp)
+			imgs = parse(l, device, blockDevs, m.Path, mp, compatible)
 			images = append(images, imgs...)
 		}
 	}

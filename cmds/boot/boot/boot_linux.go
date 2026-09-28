@@ -39,6 +39,7 @@ import (
 
 	"github.com/u-root/u-root/pkg/boot"
 	"github.com/u-root/u-root/pkg/boot/bootcmd"
+	"github.com/u-root/u-root/pkg/boot/linux"
 	"github.com/u-root/u-root/pkg/boot/localboot"
 	"github.com/u-root/u-root/pkg/boot/menu"
 	"github.com/u-root/u-root/pkg/cmdline"
@@ -71,6 +72,8 @@ func main() {
 
 	if *verbose {
 		block.Debug = log.Printf
+		// kexec_load segment layout and entry point.
+		linux.Debug = log.Printf
 	}
 	blockDevs, err := block.GetBlockDevices()
 	if err != nil {
