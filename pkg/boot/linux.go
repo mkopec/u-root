@@ -242,6 +242,34 @@ func (li *LinuxImage) loadImage(loadOpts *loadOptions) (*os.File, *os.File, erro
 	return k, i, nil
 }
 
+// iomemPath lists the running kernel's use of physical memory.
+var iomemPath = "/proc/iomem"
+
+// iomemReservations returns every /proc/iomem range that is not free System
+// RAM: the running kernel's image and FDT, firmware and device regions.
+//
+// Like kexec-tools and kexec_file_load, kexec_load must keep its segments out
+// of them. u-root's lowest-address default put an arm64 kernel at the start
+// of RAM, over the running kernel's FDT and image, and the next kernel never
+// started.
+func iomemReservations() (kexec.Ranges, error) {
+	mm, err := kexec.MemoryMapFromIOMemFile(iomemPath)
+	if err != nil {
+		return nil, fmt.Errorf("read %s: %w", iomemPath, err)
+	}
+	var rs kexec.Ranges
+	for _, r := range mm {
+		if r.Type != kexec.RangeRAM {
+			rs = append(rs, r.Range)
+		}
+	}
+	// Without CAP_SYS_ADMIN, /proc/iomem reads as all zeroes.
+	if len(mm.RAM()) == 0 || len(rs) == 0 {
+		return nil, fmt.Errorf("%s has no usable System RAM or reservations", iomemPath)
+	}
+	return rs, nil
+}
+
 // Load implements OSImage.Load and kexec_load's the kernel with its initramfs.
 func (li *LinuxImage) Load(opts ...LoadOption) error {
 	loadOpts := defaultLoadOptions()
@@ -269,7 +297,11 @@ func (li *LinuxImage) Load(opts ...LoadOption) error {
 		return nil
 	}
 	if li.LoadSyscall {
-		err := linux.KexecLoad(k, i, li.Cmdline, li.DTB, li.ReservedRanges)
+		// Never fall back to the lowest-address placement: it hangs.
+		rs, err := iomemReservations()
+		if err == nil {
+			err = linux.KexecLoad(k, i, li.Cmdline, li.DTB, append(rs, li.ReservedRanges...))
+		}
 		if err == nil || !li.FileLoadFallback {
 			return err
 		}

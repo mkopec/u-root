@@ -429,6 +429,11 @@ func memoryMapFromIOMem(r io.Reader) (MemoryMap, error) {
 	return mm, nil
 }
 
+// MemoryMapFromIOMemFile reads a memory map in /proc/iomem format from path.
+func MemoryMapFromIOMemFile(path string) (MemoryMap, error) {
+	return memoryMapFromIOMemFile(path)
+}
+
 func memoryMapFromIOMemFile(path string) (MemoryMap, error) {
 	f, err := os.Open(path)
 	if err != nil {
