@@ -549,6 +549,9 @@ func (c *parser) append(ctx context.Context, config string) error {
 					return err
 				}
 				e.DTB = dtb
+				// kexec_file_load cannot replace the DTB.
+				e.LoadSyscall = true
+				e.FileLoadFallback = false
 			}
 
 		case "menuentry":
@@ -568,6 +571,13 @@ func (c *parser) append(ctx context.Context, config string) error {
 				Kernel:  k,
 				Cmdline: cmdlineQuote(kv[2:]),
 				Env:     c.variables,
+			}
+			// Boot with the DTB shipped with this kernel rather than
+			// the running one, if there is one for this board.
+			if dtb := c.findDTB(arg); dtb != nil {
+				entry.DTB = dtb
+				entry.LoadSyscall = true
+				entry.FileLoadFallback = true
 			}
 			c.linuxEntries[c.curEntry] = entry
 			c.linuxEntries[c.curLabel] = entry

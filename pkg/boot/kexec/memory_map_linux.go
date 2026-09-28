@@ -6,6 +6,7 @@ package kexec
 
 import (
 	"bufio"
+	"encoding/binary"
 	"fmt"
 	"io"
 	"log"
@@ -154,14 +155,16 @@ func MemoryMapFromFDT(fdt *dt.FDT) (MemoryMap, error) {
 		}
 		p, found = n.LookProperty("reg")
 		if found {
-			r, err := p.AsRegion()
+			rs, err := regRegions(p)
 			if err != nil {
 				return err
 			}
-			mm = append(mm, TypedRange{
-				Range: Range{Start: uintptr(r.Start), Size: uint(r.Size)},
-				Type:  RangeRAM,
-			})
+			for _, r := range rs {
+				mm = append(mm, TypedRange{
+					Range: Range{Start: uintptr(r.Start), Size: uint(r.Size)},
+					Type:  RangeRAM,
+				})
+			}
 		}
 		return nil
 	}
@@ -173,15 +176,16 @@ func MemoryMapFromFDT(fdt *dt.FDT) (MemoryMap, error) {
 	reserveMemory := func(n *dt.Node) error {
 		p, found := n.LookProperty("reg")
 		if found {
-			r, err := p.AsRegion()
+			rs, err := regRegions(p)
 			if err != nil {
 				return err
 			}
-
-			mm.Insert(TypedRange{
-				Range: Range{Start: uintptr(r.Start), Size: uint(r.Size)},
-				Type:  RangeReserved,
-			})
+			for _, r := range rs {
+				mm.Insert(TypedRange{
+					Range: Range{Start: uintptr(r.Start), Size: uint(r.Size)},
+					Type:  RangeReserved,
+				})
+			}
 		}
 		return nil
 	}
@@ -203,6 +207,23 @@ func MemoryMapFromFDT(fdt *dt.FDT) (MemoryMap, error) {
 	mm.sort()
 	mm.mergeAdjacent()
 	return mm, nil
+}
+
+// regRegions decodes a "reg" property as a list of <u64 address, u64 size>
+// pairs (#address-cells = #size-cells = 2). Firmware such as coreboot
+// describes discontiguous RAM with several pairs in a single memory node.
+func regRegions(p *dt.Property) ([]dt.Region, error) {
+	if len(p.Value) == 0 || len(p.Value)%16 != 0 {
+		return nil, dt.ErrPropertyRegionInvalid
+	}
+	var rs []dt.Region
+	for b := p.Value; len(b) > 0; b = b[16:] {
+		rs = append(rs, dt.Region{
+			Start: binary.BigEndian.Uint64(b),
+			Size:  binary.BigEndian.Uint64(b[8:]),
+		})
+	}
+	return rs, nil
 }
 
 var memoryMapRoot = "/sys/firmware/memmap/"
