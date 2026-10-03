@@ -25,7 +25,8 @@ func isMemoryNode(n *dt.Node) bool {
 // Copied from running:
 //   - all device_type = "memory" nodes, replacing the target's,
 //   - memory reservation block entries (e.g. coreboot's CBMEM),
-//   - /firmware/coreboot, the pointer to the coreboot tables,
+//   - /firmware/coreboot, the pointer to the coreboot tables, and
+//     /firmware/optee, which tells the kernel that OP-TEE was loaded,
 //   - /reserved-memory no-map nodes the target lacks. The running kernel
 //     has no linear mapping there, and arm64 kexec relocates segments with
 //     the MMU on, so no segment may be placed in them. They also keep
@@ -66,7 +67,11 @@ func mergeFirmwareFDT(target, running *dt.FDT) {
 	}
 
 	if rf, ok := running.RootNode.LookupChildByName("firmware"); ok {
-		if cb, ok := rf.LookupChildByName("coreboot"); ok {
+		for _, name := range []string{"coreboot", "optee"} {
+			fn, ok := rf.LookupChildByName(name)
+			if !ok {
+				continue
+			}
 			tf, ok := root.LookupChildByName("firmware")
 			if !ok {
 				tf = dt.NewNode("firmware")
@@ -80,11 +85,11 @@ func mergeFirmwareFDT(target, running *dt.FDT) {
 				}
 			}
 			if idx, ok := tf.FindFirstMatchingChildIndex(func(c *dt.Node) bool {
-				return c.Name == "coreboot"
+				return c.Name == name
 			}); ok {
-				tf.Children[idx] = cb
+				tf.Children[idx] = fn
 			} else {
-				tf.Children = append(tf.Children, cb)
+				tf.Children = append(tf.Children, fn)
 			}
 		}
 	}
