@@ -40,6 +40,10 @@ type LinuxImage struct {
 	// free to use this memory unless some other mechanism (such as
 	// memmap=) reserves it.
 	ReservedRanges kexec.Ranges
+
+	// FileLoadFallback retries with kexec_file_load, which keeps the
+	// running kernel's DTB, if the LoadSyscall path fails.
+	FileLoadFallback bool
 }
 
 var _ OSImage = &LinuxImage{}
@@ -217,8 +221,9 @@ func (li *LinuxImage) loadImage(loadOpts *loadOptions) (*os.File, *os.File, erro
 		return nil, nil, err
 	}
 
-	// Append device-tree file to the end of initrd.
-	if li.DTB != nil {
+	// Append device-tree file to the end of initrd. kexec_load passes the
+	// DTB to the kernel directly, so the initrd must stay unmodified there.
+	if li.DTB != nil && !li.LoadSyscall {
 		if li.Initrd != nil {
 			li.Initrd = CatInitrds(li.Initrd, li.DTB)
 		} else {
@@ -264,7 +269,11 @@ func (li *LinuxImage) Load(opts ...LoadOption) error {
 		return nil
 	}
 	if li.LoadSyscall {
-		return linux.KexecLoad(k, i, li.Cmdline, li.DTB, li.ReservedRanges)
+		err := linux.KexecLoad(k, i, li.Cmdline, li.DTB, li.ReservedRanges)
+		if err == nil || !li.FileLoadFallback {
+			return err
+		}
+		loadOpts.logger.Printf("kexec_load failed (%v), falling back to kexec_file_load with the running DTB", err)
 	}
 	return kexec.FileLoad(k, i, li.Cmdline)
 }

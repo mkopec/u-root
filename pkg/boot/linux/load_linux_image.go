@@ -62,6 +62,13 @@ func kexecLoadImage(kernel, ramfs *os.File, cmdline string, dtb io.ReaderAt, res
 	// implicitly fall back to some other FDT. Avoid the dt.LoadFDT API.
 	if dtb != nil {
 		fdt, err = dt.ReadFDT(io.NewSectionReader(dtb, 0, math.MaxInt64))
+		if err == nil {
+			if running, rerr := dt.ReadFile("/sys/firmware/fdt"); rerr == nil {
+				mergeFirmwareFDT(fdt, running)
+			} else {
+				Debug("Not merging firmware state into DTB: %v", rerr)
+			}
+		}
 	} else {
 		fdt, err = dt.ReadFile("/sys/firmware/fdt")
 	}
