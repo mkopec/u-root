@@ -16,7 +16,9 @@ import (
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
+	"github.com/u-root/u-root/pkg/boot/pez"
 	"github.com/u-root/u-root/pkg/curl"
+	"github.com/u-root/u-root/pkg/dt"
 	"github.com/u-root/u-root/pkg/mount"
 	"github.com/u-root/uio/uio"
 	"github.com/u-root/uio/ulog/ulogtest"
@@ -290,6 +292,53 @@ func TestLoadLinuxImage(t *testing.T) {
 				if diff := cmp.Diff(string(initrdBytes), string(wantInitrdBytes)); diff != "" {
 					t.Errorf("got initrd %s, want %s, diff (+got, -want): %s", string(initrdBytes), string(wantInitrdBytes), diff)
 				}
+			}
+		})
+	}
+}
+
+func testFDTBytes(t *testing.T, compatible ...string) []byte {
+	t.Helper()
+	fdt := &dt.FDT{RootNode: dt.NewNode("/", dt.WithProperty(
+		dt.Property{Name: "compatible", Value: []byte(strings.Join(compatible, "\x00") + "\x00")},
+	))}
+	fdt.Header.Magic = dt.Magic
+	fdt.Header.Version = 17
+	var b bytes.Buffer
+	if _, err := fdt.Write(&b); err != nil {
+		t.Fatal(err)
+	}
+	return b.Bytes()
+}
+
+func TestUKIDTB(t *testing.T) {
+	old := firmwareFDTPath
+	t.Cleanup(func() { firmwareFDTPath = old })
+	firmwareFDTPath = filepath.Join(t.TempDir(), "fdt")
+	if err := os.WriteFile(firmwareFDTPath, testFDTBytes(t, "google,ciri-sku0", "google,ciri", "mediatek,mt8188"), 0o444); err != nil {
+		t.Fatal(err)
+	}
+
+	sku0 := bytes.NewReader(testFDTBytes(t, "google,ciri-sku0", "google,ciri", "mediatek,mt8188"))
+	sku1 := bytes.NewReader(testFDTBytes(t, "google,ciri-sku1", "google,ciri", "mediatek,mt8188"))
+	other := bytes.NewReader(testFDTBytes(t, "google,ciri", "mediatek,mt8188"))
+	fixed := bytes.NewReader([]byte("not checked"))
+	l := ulogtest.Logger{TB: t}
+
+	for _, tt := range []struct {
+		name string
+		uki  *pez.UKI
+		want io.ReaderAt
+	}{
+		{name: "board in .dtbauto", uki: &pez.UKI{DTBAuto: []io.ReaderAt{sku1, other, sku0}}, want: sku0},
+		// Only the most specific compatible string counts.
+		{name: "board not in .dtbauto", uki: &pez.UKI{DTBAuto: []io.ReaderAt{sku1, other}}, want: nil},
+		{name: ".dtb wins", uki: &pez.UKI{DTB: fixed, DTBAuto: []io.ReaderAt{sku0}}, want: fixed},
+		{name: "no device trees", uki: &pez.UKI{}, want: nil},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := ukiDTB(tt.uki, l); got != tt.want {
+				t.Errorf("ukiDTB() = %v, want %v", got, tt.want)
 			}
 		})
 	}

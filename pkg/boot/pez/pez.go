@@ -62,6 +62,9 @@ const (
 	// peSectionNameSize is the maximum size of a section name in the section header (8 bytes).
 	peSectionNameSize = 8
 
+	// peSectionVirtualSizeOffset is the offset of the VirtualSize field
+	// relative to the start of a section header entry.
+	peSectionVirtualSizeOffset = 8
 	// peSectionRawSizeOffset is the offset of the SizeOfRawData field relative to the start of a section header entry.
 	peSectionRawSizeOffset = 16
 
@@ -96,67 +99,128 @@ func readAt(img io.ReaderAt, offset int64, size int) ([]byte, error) {
 	return buf, nil
 }
 
-// findLinuxSection scans the PE/COFF image header and section table to locate the ".linux"
-// section. This section houses the compressed ARM64 EFI zboot kernel payload.
-// Returns the file offset and size of the section if found, or an error.
-func findLinuxSection(img io.ReaderAt) (int64, int64, error) {
+// section is a section of a PE/COFF image.
+type section struct {
+	name   string
+	offset int64
+	size   int64
+}
+
+// sections returns the sections of a PE/COFF image, in the order of the
+// section table.
+func sections(img io.ReaderAt) ([]section, error) {
 	// Read the offset pointing to the start of the PE header from the DOS stub (0x3c).
 	buf, err := readAt(img, dosHeaderPEOffsetAddr, peHeaderOffsetSize)
 	if err != nil {
-		return 0, 0, err
+		return nil, err
 	}
 	peOffset := binary.LittleEndian.Uint32(buf)
 
 	// Read and verify the PE signature ("PE\x00\x00") at the start of the PE header.
 	buf, err = readAt(img, int64(peOffset), peSignatureLen)
 	if err != nil {
-		return 0, 0, err
+		return nil, err
 	}
 	if string(buf) != peSignature {
-		return 0, 0, fmt.Errorf("invalid PE signature")
+		return nil, fmt.Errorf("invalid PE signature")
 	}
 
 	// Read the number of sections from the COFF File Header.
 	buf, err = readAt(img, int64(peOffset)+coffNumSectionsOffset, coffNumSectionsSize)
 	if err != nil {
-		return 0, 0, err
+		return nil, err
 	}
 	numSections := binary.LittleEndian.Uint16(buf)
 
 	// Read the optional header size from the COFF File Header to compute where the Section Table begins.
 	buf, err = readAt(img, int64(peOffset)+coffOptHeaderSizeOffset, coffOptHeaderSizeSize)
 	if err != nil {
-		return 0, 0, err
+		return nil, err
 	}
 	optHeaderSize := binary.LittleEndian.Uint16(buf)
 
 	// The Section Table starts immediately after the Optional Header (PE Signature + COFF Header + Optional Header).
 	sectionTableOffset := int64(peOffset) + coffHeaderSize + int64(optHeaderSize)
+	var secs []section
 	for i := 0; i < int(numSections); i++ {
 		// Seek to each 40-byte section entry and read it.
 		entryOffset := sectionTableOffset + int64(i*peSectionEntrySize)
 		buf, err = readAt(img, entryOffset, peSectionEntrySize)
 		if err != nil {
-			return 0, 0, err
+			return nil, err
 		}
 
 		// Read the 8-character section name and trim trailing null bytes.
-		name := buf[0:peSectionNameSize]
-		nameLen := 0
-		for nameLen < peSectionNameSize && name[nameLen] != 0 {
-			nameLen++
-		}
-		nameStr := string(name[:nameLen])
+		name := string(bytes.TrimRight(buf[0:peSectionNameSize], "\x00"))
+		virtSize := binary.LittleEndian.Uint32(buf[peSectionVirtualSizeOffset : peSectionVirtualSizeOffset+4])
+		rawSize := binary.LittleEndian.Uint32(buf[peSectionRawSizeOffset : peSectionRawSizeOffset+4])
+		rawOffset := binary.LittleEndian.Uint32(buf[peSectionRawOffsetOffset : peSectionRawOffsetOffset+4])
 
-		// If this is the ".linux" section, extract its offset and size.
-		if nameStr == ".linux" {
-			rawSize := binary.LittleEndian.Uint32(buf[peSectionRawSizeOffset : peSectionRawSizeOffset+4])
-			rawOffset := binary.LittleEndian.Uint32(buf[peSectionRawOffsetOffset : peSectionRawOffsetOffset+4])
-			return int64(rawOffset), int64(rawSize), nil
+		// The raw data is padded to the file alignment. The data itself
+		// is VirtualSize bytes long, if that is set.
+		size := rawSize
+		if virtSize != 0 && virtSize < rawSize {
+			size = virtSize
+		}
+		secs = append(secs, section{name: name, offset: int64(rawOffset), size: int64(size)})
+	}
+	return secs, nil
+}
+
+// findLinuxSection locates the ".linux" section of a PE/COFF image, which
+// houses the kernel in a unified kernel image (UKI).
+// Returns the file offset and size of the section if found, or an error.
+func findLinuxSection(img io.ReaderAt) (int64, int64, error) {
+	secs, err := sections(img)
+	if err != nil {
+		return 0, 0, err
+	}
+	for _, s := range secs {
+		if s.name == ".linux" {
+			return s.offset, s.size, nil
 		}
 	}
-
 	return 0, 0, fmt.Errorf("no .linux section found")
+}
+
+// ErrNotUKI is returned for images without a .linux section.
+var ErrNotUKI = errors.New("not a unified kernel image")
+
+// UKI holds the sections of a unified kernel image (UKI) or a kernel image
+// with a stub such as systemd-stub or stubble, that a loader that doesn't run
+// the stub needs.
+type UKI struct {
+	// Linux is the kernel, which may be compressed itself.
+	Linux io.ReaderAt
+	// DTB is the device tree of the .dtb section, or nil.
+	DTB io.ReaderAt
+	// DTBAuto are the device trees of the .dtbauto sections, among
+	// which the stub picks the one matching the board.
+	DTBAuto []io.ReaderAt
+}
+
+// ParseUKI returns the sections of a unified kernel image, or ErrNotUKI.
+func ParseUKI(img io.ReaderAt) (*UKI, error) {
+	secs, err := sections(img)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w", ErrNotUKI, err)
+	}
+	u := &UKI{}
+	for _, s := range secs {
+		r := io.NewSectionReader(img, s.offset, s.size)
+		switch s.name {
+		case ".linux":
+			u.Linux = r
+		case ".dtb":
+			u.DTB = r
+		case ".dtbauto":
+			u.DTBAuto = append(u.DTBAuto, r)
+		}
+	}
+	if u.Linux == nil {
+		return nil, ErrNotUKI
+	}
+	return u, nil
 }
 
 // Extract extracts and decompresses the embedded bootable ARM64 kernel payload

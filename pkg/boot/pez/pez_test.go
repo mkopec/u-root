@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
@@ -344,4 +345,70 @@ func TestHeaderCompressionBoundsCheck(t *testing.T) {
 		// This line should panic because buf[24:28] goes out of bounds on a slice of size 27.
 		copy(header.Compression[:], buf[24:28])
 	})
+}
+
+// newTestUKI returns a PE image with the given sections. The raw data of each
+// section is padded to 512 bytes, as with a file alignment.
+func newTestUKI(t *testing.T, names []string, payloads [][]byte) []byte {
+	t.Helper()
+
+	const peOffset, align = 64, 512
+	tableEnd := peOffset + 24 + 40*len(names)
+	dataStart := (tableEnd + align - 1) / align * align
+	buf := make([]byte, dataStart)
+	buf[0], buf[1] = 'M', 'Z'
+	binary.LittleEndian.PutUint32(buf[0x3c:], peOffset)
+	copy(buf[peOffset:], "PE\x00\x00")
+	binary.LittleEndian.PutUint16(buf[peOffset+6:], uint16(len(names)))
+	for i, name := range names {
+		e := buf[peOffset+24+40*i:]
+		copy(e, name)
+		raw := (len(payloads[i]) + align - 1) / align * align
+		binary.LittleEndian.PutUint32(e[8:], uint32(len(payloads[i])))
+		binary.LittleEndian.PutUint32(e[16:], uint32(raw))
+		binary.LittleEndian.PutUint32(e[20:], uint32(len(buf)))
+		data := make([]byte, raw)
+		copy(data, payloads[i])
+		buf = append(buf, data...)
+	}
+	return buf
+}
+
+func readAll(t *testing.T, r io.ReaderAt) []byte {
+	t.Helper()
+	b, err := io.ReadAll(io.NewSectionReader(r, 0, math.MaxInt64))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
+
+func TestParseUKI(t *testing.T) {
+	img := newTestUKI(t,
+		[]string{".osrel", ".linux", ".dtbauto", ".hwids", ".dtbauto"},
+		[][]byte{[]byte("ID=ubuntu"), []byte("kernel"), []byte("dtb one"), []byte("{}"), []byte("dtb two")})
+	u, err := ParseUKI(bytes.NewReader(img))
+	if err != nil {
+		t.Fatalf("ParseUKI() = %v", err)
+	}
+	// The sections end at their VirtualSize, not at the padding.
+	if got := readAll(t, u.Linux); string(got) != "kernel" {
+		t.Errorf(".linux = %q, want %q", got, "kernel")
+	}
+	if u.DTB != nil {
+		t.Errorf(".dtb = %v, want nil", u.DTB)
+	}
+	if len(u.DTBAuto) != 2 || string(readAll(t, u.DTBAuto[0])) != "dtb one" ||
+		string(readAll(t, u.DTBAuto[1])) != "dtb two" {
+		t.Errorf(".dtbauto sections are wrong: %d", len(u.DTBAuto))
+	}
+
+	for name, img := range map[string][]byte{
+		"no .linux": newTestUKI(t, []string{".dtb"}, [][]byte{[]byte("dtb")}),
+		"not PE":    []byte("an arm64 Image, not a PE file, of more than 64 bytes ......."),
+	} {
+		if _, err := ParseUKI(bytes.NewReader(img)); !errors.Is(err, ErrNotUKI) {
+			t.Errorf("%s: ParseUKI() = %v, want %v", name, err, ErrNotUKI)
+		}
+	}
 }

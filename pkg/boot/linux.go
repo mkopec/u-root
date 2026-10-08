@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"runtime"
 	"strings"
@@ -16,8 +17,10 @@ import (
 	"github.com/u-root/u-root/pkg/boot/linux"
 	"github.com/u-root/u-root/pkg/boot/pez"
 	"github.com/u-root/u-root/pkg/boot/util"
+	"github.com/u-root/u-root/pkg/dt"
 	"github.com/u-root/u-root/pkg/mount"
 	"github.com/u-root/uio/uio"
+	"github.com/u-root/uio/ulog"
 	"golang.org/x/sys/unix"
 )
 
@@ -209,8 +212,16 @@ func (li *LinuxImage) loadImage(loadOpts *loadOptions) (*os.File, *os.File, erro
 	image := util.TryGzipFilter(li.Kernel)
 
 	if runtime.GOARCH == "arm64" {
-		// On arm64, the Image kernel can be encapsulated in a PE file.
-		// Try to extract the payload from the PE file.
+		// On arm64, the Image kernel can be encapsulated in a PE file:
+		// a unified kernel image, or a kernel with a stub such as
+		// stubble, which carry it in a .linux section, maybe with
+		// device trees, or a compressed EFI zboot image.
+		if uki, err := pez.ParseUKI(image); err == nil {
+			image = util.TryGzipFilter(uki.Linux)
+			if li.DTB == nil {
+				li.DTB = ukiDTB(uki, loadOpts.logger)
+			}
+		}
 		if payload, err := pez.Extract(image); err == nil {
 			image = payload
 		}
@@ -240,6 +251,55 @@ func (li *LinuxImage) loadImage(loadOpts *loadOptions) (*os.File, *os.File, erro
 		}
 	}
 	return k, i, nil
+}
+
+// firmwareFDTPath is the device tree that the running kernel got.
+var firmwareFDTPath = "/sys/firmware/fdt"
+
+// ukiDTB returns the device tree that a stub would pass to the kernel of a
+// UKI: the one of its .dtb section, or the one of its .dtbauto sections that
+// is for the board. As systemd-stub and stubble do with the device tree of
+// the firmware, the board is identified by the first string of the compatible
+// property of the root node of the running device tree. Without a match,
+// it returns nil and the running device tree is used.
+func ukiDTB(uki *pez.UKI, l ulog.Logger) io.ReaderAt {
+	if uki.DTB != nil {
+		return uki.DTB
+	}
+	if len(uki.DTBAuto) == 0 {
+		return nil
+	}
+	running, err := dt.ReadFile(firmwareFDTPath)
+	if err != nil {
+		l.Printf("Not choosing among the device trees of the UKI: %v", err)
+		return nil
+	}
+	board := fdtCompatible(running)
+	if board == "" {
+		return nil
+	}
+	for _, r := range uki.DTBAuto {
+		fdt, err := dt.ReadFDT(io.NewSectionReader(r, 0, math.MaxInt64))
+		if err != nil {
+			continue
+		}
+		if fdtCompatible(fdt) == board {
+			l.Printf("Using the device tree of the UKI for %s", board)
+			return r
+		}
+	}
+	l.Printf("The UKI has no device tree for %s", board)
+	return nil
+}
+
+// fdtCompatible returns the first compatible string of the root node.
+func fdtCompatible(fdt *dt.FDT) string {
+	p, ok := fdt.RootNode.LookProperty("compatible")
+	if !ok {
+		return ""
+	}
+	c, _, _ := strings.Cut(string(p.Value), "\x00")
+	return c
 }
 
 // iomemPath lists the running kernel's use of physical memory.
